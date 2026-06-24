@@ -1,0 +1,224 @@
+
+BEFORE STARTING ONE THING WHICH I WANT TO MAKE CLEAR:
+IN ORDER TO CHECK FOR SWAPIN , SWAPOUT , EVICT , VICTIM 
+CHANGE RAM TO 32 INSIDE THE MEMLAYOUT FILE IN KERNAL AND THEN RUN THE MOST COMPREHNSIVE TEST WHICH TEST_SWAPMIX WHICH WILL TEST EVERYTHING INCLUDING SWAPIN , SWAPOUT AS WELL AS PRINT MEMSTATS.
+
+XV6-RISCV: Lazy Exec Paging, Swapping (FIFO), and Bonus Clean-First FIFO
+
+This fork of xv6-riscv adds demand paging for executable segments, a FIFO-based
+page replacement policy with swap support, and an optional bonus variant that
+prefers evicting clean pages first (Clean-First FIFO). The default build keeps
+the original object list intact and only extends behavior; the bonus policy is
+compiled into a separate kernel binary so you can compare results easily.
+
+
+What’s implemented
+
+- Lazy exec paging: Text and data segments of a freshly exec’d process are
+	mapped on demand. The first execute/read to a page triggers a page fault that
+	loads just that page from the executable into memory and maps it.
+- Correct instruction and TLB fencing: After mapping a text page or granting X
+	permission, the kernel issues sfence.vma and fence.i to ensure the CPU sees
+	the freshly loaded instructions.
+- Safe page-fault I/O: Disk I/O during fault handling runs with interrupts
+	enabled to avoid deadlock with the block driver’s interrupt path.
+- Swapping with FIFO replacement: When physical memory is exhausted, the kernel
+	evicts the oldest resident page (per-process FIFO) and either discards it if
+	clean or writes it to the process’s swap file if dirty.
+- Per-process memory statistics: Each process tracks pages as RESIDENT,
+	SWAPPED, or UNMAPPED, along with a simple FIFO sequence number.
+- Bonus selectable algorithm: An alternative victim selection that prefers
+	evicting clean pages first, falling back to FIFO when all candidates are
+	dirty. Built as a separate kernel image; the default kernel remains FIFO.
+
+
+Build and run
+
+Prerequisites
+
+- RISC-V toolchain (one of riscv64-unknown-elf-, riscv64-elf-,
+	riscv64-linux-gnu-). The Makefile auto-detects common prefixes.
+- QEMU version 7.2 or newer (Makefile verifies this).
+
+Normal build (FIFO) and run
+
+1) Clean and build kernel and user programs:
+
+	 make clean && make
+
+2) Boot xv6 in QEMU (this builds fs.img automatically):
+
+	 make qemu
+
+You should see logs like:
+
+	[pid N] INIT-LAZYMAP text=[...] data=[...] heap_start=... stack_top=...
+	[pid N] PAGEFAULT va=... access=exec cause=exec
+	[pid N] LOADEXEC va=...
+	[pid N] RESIDENT va=... seq=...
+
+Bonus build (Clean-First FIFO) and run
+
+1) Build the alternate kernel image:
+
+	 make kernel-bonus
+
+2) Boot xv6 with the bonus kernel:
+
+	 make qemu-bonus
+
+While running, eviction logs include algo=CLEANFIFO, e.g.:
+
+	[pid N] VICTIM va=0x... seq=... algo=CLEANFIFO
+
+
+How to use and test inside xv6
+
+- At the shell prompt, run usertests to exercise a variety of VM behaviors:
+
+	$ usertests
+
+- Other helpful user programs:
+	- memstat: prints per-process memory stats from the kernel
+	- test_lazy, test_eviction, test_swap, test_swapseq, test_swapmix, etc.
+
+Notes
+
+- This README is non-empty so tests that read README (e.g., rwsbrk in
+	usertests) actually read bytes and exercise the kernel’s copyout path.
+- If you change the set of user programs, re-run make (it will rebuild fs.img).
+
+
+Implementation overview
+
+Lazy exec mapping and page faults
+
+- During exec, the kernel records text/data virtual ranges, file offsets, and
+	sizes in the process struct but does not pre-populate all pages.
+- On a user page fault, vmfault() decides what to do based on the faulting VA:
+	- Text/data page below the break (p->sz): allocate a frame, zero-fill, read
+		the corresponding file slice from the exec inode, and map with
+		PTE_U|PTE_R|PTE_X (text) or PTE_U|PTE_R|PTE_W (data). After mapping text,
+		the kernel issues sfence.vma and fence.i to flush the instruction cache.
+	- Heap/stack pages below p->sz: allocate a zeroed frame and map writable.
+	- Guard page or addresses outside valid regions: fault is invalid.
+- copyin/copyout/copyinstr transparently trigger vmfault() to fault-in pages
+	when accessing valid but not-yet-resident user addresses.
+
+Swapping and FIFO replacement (default)
+
+- When kalloc() fails, try_kalloc_or_replace() selects a victim page from the
+	current process using a FIFO policy:
+	- Each resident page is tagged with a monotonically increasing seq number.
+	- The oldest resident page (smallest seq; VA tie-breaker) is chosen.
+	- If the page is clean, it is DISCARDed; if dirty, it is SWAPOUT to the
+		process’s swap file, and metadata is updated accordingly.
+	- The page is unmapped, physical memory is freed, and sfence.vma is issued.
+	- Allocation is retried; if it still fails (extremely unlikely), the process
+		is killed with an informative log.
+
+Bonus: Clean-First FIFO victim selection
+
+- The bonus kernel (kernel-bonus) implements a slight variant: among resident
+	pages, prefer evicting a clean page with the oldest seq; if no clean page is
+	available, fall back to the oldest page regardless of dirtiness.
+- This tends to reduce swap traffic in workloads that touch many pages
+	read-only or sparsely, at the small risk of evicting a recently used clean
+	page before an older dirty one.
+- The rest of the swapping pipeline (DISC­ARD vs SWAPOUT, unmap, fence) is
+	identical to the default kernel.
+
+Developer pointers (files of interest)
+
+- kernel/vm.c          Core VM: walk/mappages, {copyin,copyout}, vmfault,
+											 FIFO selection and eviction pipeline.
+- kernel/swap.c        Swap file management (per-process swap file I/O).
+- kernel/trap.c        User trap handler; logs and page-fault dispatch; ensures
+											 interrupts are enabled during potentially blocking I/O.
+- kernel/exec.c        Records text/data metadata for lazy loading.
+- kernel/proc.c        Process lifecycle, either_copy{in,out} helpers.
+- kernel/vm_bonus.c    Bonus variant with Clean-First FIFO victim selection.
+- Makefile             Adds kernel-bonus and qemu-bonus without altering the
+											 default OBJS list or qemu behavior.
+
+Verifying which algorithm is running
+
+- Default FIFO kernel logs victim selection as:
+	[pid N] VICTIM ... algo=FIFO
+- Bonus kernel logs:
+	[pid N] VICTIM ... algo=CLEANFIFO
+
+Troubleshooting
+
+- QEMU version error: The Makefile checks and requires QEMU >= 7.2.
+- Stale builds: Run `make clean && make` to fully rebuild kernel, userland,
+	and fs.img.
+- Empty README: If you accidentally empty this file, some tests may get EOF
+	when reading README; keep a few bytes of content here.
+
+
+
+# Bonus: Alternative Page Replacement (Clean-First FIFO)
+
+This bonus implementation adds an optional page replacement policy without changing the default kernel behavior.
+
+- Default build (unchanged): Uses the existing FIFO victim selection implemented in `kernel/vm.c`.
+- Bonus build (optional): Uses a Clean-First FIFO variant implemented in `kernel/vm_bonus.c` and a separate build target. No default files are modified in a way that changes behavior.
+
+## Algorithm description
+
+Clean-First FIFO:
+- Prefer evicting the resident page with the smallest FIFO sequence number among CLEAN pages (is_dirty == 0).
+- If no clean pages exist, fall back to the oldest page overall (standard FIFO).
+- Only pages of the current faulting process are considered.
+- Dirty pages are swapped out; clean pages are discarded.
+
+## Design rationale
+
+- Minimizes swap traffic by preferring clean pages, which can be discarded cheaply.
+- Falls back to FIFO to maintain fairness and simplicity.
+- Works well with multi-process workloads because victim selection consults only the current process’s `memstat` state.
+
+## Implementation details
+
+Files:
+- `kernel/vm_bonus.c`: Full copy of the VM subsystem with the only change in victim selection (`select_victim_cleanfifo_index`) and corresponding log tag.
+- `Makefile`: Adds new targets `kernel-bonus` and `qemu-bonus` that link the bonus kernel by substituting `vm.o` with `vm_bonus.o`. The default targets are untouched.
+
+Logs:
+- Memory full: `[pid N] MEMFULL`
+- Victim selection: `[pid N] VICTIM va=0x... seq=S algo=CLEANFIFO` (default build logs `algo=FIFO`).
+- Eviction outcome: `[pid N] EVICT  va=0x... state=clean|dirty`
+- Clean discard: `[pid N] DISCARD va=0x...`
+- Dirty swap out: `[pid N] SWAPOUT va=0x... slot=X`
+
+## How to build and run
+
+Default (unchanged) build:
+
+- Build:
+  make -C xv6-riscv clean && make -C xv6-riscv
+- Run:
+  make -C xv6-riscv qemu
+
+Bonus build (optional):
+
+- Build only the bonus kernel image:
+  make -C xv6-riscv kernel/kernel-bonus
+- Run bonus kernel:
+  make -C xv6-riscv qemu-bonus
+
+## Verifying default behavior is unchanged
+
+1. Inspect the link line: `make -n qemu` still links `... kernel/vm.o ...` (not `vm_bonus.o`).
+2. Run the default kernel and observe victim logs with `algo=FIFO`:
+   make -C xv6-riscv qemu
+3. Run the bonus kernel and observe `algo=CLEANFIFO` in victim logs:
+   make -C xv6-riscv qemu-bonus
+
+Only the Makefile gained new targets and a new file was added. The default objects list `OBJS` and all original sources remain intact.
+
+## Notes
+
+- The `memstat` bookkeeping and swap code paths are unchanged. Dirty marking is still driven by write faults.
+- All console log formats match the original requirements; the only extra token is the algorithm tag.
